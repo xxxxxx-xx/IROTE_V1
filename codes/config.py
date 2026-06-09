@@ -53,6 +53,6 @@ GENERIC_API_MODELS = {
         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
         "api_key_env": "MIMO_AUTH_TOKEN",
         "model_id": "mimo-v2.5-pro",
-        "auth_header": "tp-cjllv5u99ugddhs46ue7fv9s9ox1t88m28syf8edav6smmgf",
+        "auth_header": "xxxxx",
     },
 }
