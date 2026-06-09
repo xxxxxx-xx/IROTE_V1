@@ -1,48 +1,32 @@
 """
-IROTE Full Optimization Script
-===============================
-Integrates irote_core algorithm with existing evaluation framework.
-Implements the complete Algorithm 1 from the paper.
+IROTE Optimization - Paper-Aligned Implementation
+==================================================
+Implements the full IROTE Algorithm 1 with:
+- Eq.(1): Joint objective compactness + β * evocativeness
+- Eq.(2)(3): Compactness with behavior sampling
+- Eq.(4)(5): Evocativeness with M2 sampling and q_ω evaluation
 
 Usage:
-    E:\\anaconda\\envs\\cottonagent\\python.exe optimization_irote.py \\
-        --model_name MiMo-v2.5-Pro \\
-        --evaluation_system personality \\
-        --specific_traits extraversion \\
-        --max_iteration 5
+    python optimization_irote.py --model_name MiMo-v2.5-Pro --specific_traits extraversion
 """
 
 import random
 random.seed(312)
 import os
-import re
 import json
 import argparse
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 from typing import List, Dict
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import PATH_TO_SIMCSE_MODEL
 from models.router import ModelRouter
-from eval_utils import Evaluator
-from eval_utils.controller import Controller
-from tools import Retriever
-
 from irote_core import (
     Reflection,
-    sample_behaviors,
-    compact_reflection,
-    sample_task_responses,
-    evaluate_responses,
-    compute_R2,
-    generate_revised_candidates,
-    rank_candidates,
-    extract_questionnaire_score,
     run_irote_iteration,
+    extract_questionnaire_score,
 )
 
 
@@ -50,11 +34,8 @@ def load_optimize_tasks(evaluation_system: str, target_trait: str, questionnaire
     """
     Load optimization tasks (questionnaire items for the target trait).
     Paper: "Questionnaires marked with * are used for reflection optimization"
-    For BigFive: BFI*; For STBHV: PVQ21*, PVQ-RR*; For MFT: MFQ-1*
     """
     tasks = []
-
-    # Select optimization questionnaires based on system
     opt_questionnaires = {
         "personality": ["BFI"],
         "value": ["PVQ21", "PVQ-RR"],
@@ -101,11 +82,7 @@ def load_optimize_tasks(evaluation_system: str, target_trait: str, questionnaire
 
 
 def load_open_tasks(target_trait: str, n_tasks: int = 10) -> List[Dict]:
-    """
-    Generate open-ended tasks for evocativeness evaluation.
-    Paper uses downstream tasks like creative writing, controversial QA, etc.
-    For initial reproduction, we use template-based open tasks.
-    """
+    """Generate open-ended tasks for evocativeness evaluation."""
     task_templates = {
         "extraversion": [
             "Write a short paragraph about how you would behave at a lively party where you know almost nobody.",
@@ -150,7 +127,7 @@ def load_open_tasks(target_trait: str, n_tasks: int = 10) -> List[Dict]:
             "You have to give a speech to a large audience tomorrow. Write about tonight.",
             "Something you worked hard on gets rejected. Describe your internal experience.",
             "Describe how you handle a situation where you feel overwhelmed with responsibilities.",
-            "You make a embarrassing mistake in public. Write about your reaction.",
+            "You make an embarrassing mistake in public. Write about your reaction.",
             "Describe your response to receiving ambiguous feedback on your work.",
             "You're waiting for important news that could affect your career. Write about the wait.",
             "Describe how you cope when multiple things go wrong in the same day.",
@@ -184,22 +161,9 @@ def load_open_tasks(target_trait: str, n_tasks: int = 10) -> List[Dict]:
     ]
 
 
-def score_questionnaire_response(response: str, task: Dict) -> float:
-    """Score a questionnaire response using rule-based extraction."""
-    raw = extract_questionnaire_score(
-        response,
-        scale=task.get("scale", 5),
-        reverse=task.get("reverse", False),
-    )
-    if raw is not None:
-        return raw
-    return 0.5  # default neutral score if parsing fails
-
-
 def run_irote_optimization(
     args,
     target_trait: str,
-    evaluator: Evaluator,
     router: ModelRouter,
 ):
     """
@@ -231,7 +195,7 @@ def run_irote_optimization(
     print(f"\n{'='*70}")
     print(f"IROTE Optimization: {target_trait}")
     print(f"Model: {args.model_name}")
-    print(f"Iterations: {args.max_iteration}, K={args.init_reflection_num}, M1={args.M1}, M2={args.M2}")
+    print(f"Iterations: {args.max_iteration}, K={args.K}, M1={args.M1}, M2={args.M2}, β={args.beta}")
     print(f"{'='*70}")
 
     # Load tasks
@@ -250,22 +214,16 @@ def run_irote_optimization(
     else:
         trait_reflections = []
 
-    if len(trait_reflections) < args.init_reflection_num:
-        print(f"Warning: Only {len(trait_reflections)} initial reflections available (need {args.init_reflection_num})")
-        print("Generating additional reflections via LLM...")
-        from irote_core import build_behavior_sampling_prompt, extract_json_list
-        # Generate more via LLM
-        gen_prompt = f"""Generate {args.init_reflection_num} diverse first-person self-reflections for the trait: {target_trait}.
-Trait description: {trait_desc}
+    if len(trait_reflections) < args.K:
+        print(f"Warning: Only {len(trait_reflections)} initial reflections (need {args.K}). Generating more...")
+        from irote_core import extract_json_list
+        gen_prompt = f"""Generate {args.K} diverse first-person self-reflections for trait: {target_trait}.
+Description: {trait_desc}
 
-Each reflection should:
-1. Describe self-perceived experiences, habits, values, or motivations
-2. Use format: "I [verb]..., e.g.: [concrete example]"
-3. Be under 50 words
-4. NOT say "I am {target_trait}" directly
-5. NOT include demographic info (age, gender, country, religion)
+Format: "I [verb]..., e.g.: [concrete example]"
+Under 50 words each. No explicit labels like "I am {target_trait}". No demographics.
 
-Output a JSON list of strings only."""
+Output JSON list: ["reflection 1", ...]"""
         messages = [[{"role": "user", "content": gen_prompt}]]
         responses = router.request_llm(
             conversations=messages,
@@ -276,29 +234,22 @@ Output a JSON list of strings only."""
         generated = extract_json_list(responses[0]) if responses else []
         trait_reflections.extend(generated)
 
-    # Take first K reflections
-    candidate_texts = trait_reflections[:args.init_reflection_num]
+    candidate_texts = trait_reflections[:args.K]
     print(f"Initial reflections: {len(candidate_texts)}")
 
-    # Convert task prompts to strings for irote_core
+    # Task prompts for irote_core
     task_prompts = [t["prompt"] for t in all_tasks]
 
-    # Initialize tracking
+    # Main optimization loop
     best_reflection = None
     best_score = -float("inf")
     history = []
 
-    # Main optimization loop (Algorithm 1)
     for t in range(1, args.max_iteration + 1):
-        print(f"\n{'='*70}")
-        print(f"Iteration {t}/{args.max_iteration}")
-        print(f"{'='*70}")
-
         current_reflection = best_reflection if best_reflection else "\n".join(
             [f"{i+1}. {r}" for i, r in enumerate(candidate_texts[:5])]
         )
 
-        # Run one IROTE iteration
         result = run_irote_iteration(
             router=router,
             iteration=t,
@@ -308,35 +259,31 @@ Output a JSON list of strings only."""
             trait_name=target_trait,
             trait_description=trait_desc,
             model_name=args.model_name,
-            judge_model=args.model_name,  # use same model as judge
-            K=args.init_reflection_num,
+            K=args.K,
             M1=args.M1,
             M2=args.M2,
-            max_words=args.words_limit,
             beta=args.beta,
-            gamma=0.3,
-            alpha_len=0.1,
-            alpha_dup=0.1,
+            max_words=args.words_limit,
         )
 
-        # Update best reflection
+        # Update best
         new_best = result["best_reflection"]
-        new_best_score = new_best.scores.get("final_score", result.get("r2_score", 0))
+        new_best_score = new_best.scores.get("final_score", 0)
         if new_best_score > best_score:
             best_score = new_best_score
             best_reflection = new_best.text
 
-        # Update candidates for next iteration
+        # Update candidates
         if result["ranked_candidates"]:
-            candidate_texts = [r.text for r in result["ranked_candidates"][:args.init_reflection_num]]
+            candidate_texts = [r.text for r in result["ranked_candidates"][:args.K]]
 
-        # Save iteration results
+        # Save iteration
         iter_save = {
             "iteration": t,
             "current_reflection": current_reflection,
             "compacted_reflection": result["compacted_reflection"],
             "r2_score": result["r2_score"],
-            "avg_trait_score": result["avg_trait_score"],
+            "avg_q_score": result["avg_q_score"],
             "best_reflection": new_best.text,
             "best_score": new_best.scores,
             "n_candidates": len(result["ranked_candidates"]),
@@ -347,93 +294,77 @@ Output a JSON list of strings only."""
             json.dump(iter_save, f, indent=2, ensure_ascii=False)
 
         print(f"\nIteration {t} Summary:")
-        print(f"  R2 score: {result['r2_score']:.4f}")
-        print(f"  Avg trait score: {result['avg_trait_score']:.4f}")
-        print(f"  Best candidate score: {new_best.scores.get('final_score', 0):.4f}")
-        print(f"  Global best score: {best_score:.4f}")
+        print(f"  R2: {result['r2_score']:.4f}, Avg q_ω: {result['avg_q_score']:.4f}")
+        print(f"  Best score: {new_best_score:.4f}, Global best: {best_score:.4f}")
 
-        # Early stopping check
+        # Early stopping
         if t >= 3 and len(history) >= 2:
-            prev_score = history[-2]["best_score"].get("final_score", 0)
-            curr_score = history[-1]["best_score"].get("final_score", 0)
-            if curr_score - prev_score < 0.01:
-                print(f"\nEarly stopping: score improvement < 0.01 for 2 consecutive iterations")
+            prev = history[-2]["best_score"].get("final_score", 0)
+            curr = history[-1]["best_score"].get("final_score", 0)
+            if curr - prev < 0.01:
+                print(f"\nEarly stopping: improvement < 0.01")
                 break
 
     # Save final result
-    final_result = {
+    final = {
         "trait": target_trait,
         "model": args.model_name,
+        "params": {"K": args.K, "M1": args.M1, "M2": args.M2, "beta": args.beta, "T": args.max_iteration},
         "iterations": len(history),
         "best_reflection": best_reflection,
         "best_score": best_score,
         "history": history,
     }
     with open(os.path.join(output_dir, "final_reflection.json"), "w") as f:
-        json.dump(final_result, f, indent=2, ensure_ascii=False)
+        json.dump(final, f, indent=2, ensure_ascii=False)
 
     print(f"\n{'='*70}")
     print(f"Optimization Complete!")
-    print(f"Best reflection ({best_score:.4f}):")
+    print(f"Best reflection (score={best_score:.4f}):")
     print(f"{best_reflection}")
-    print(f"Results saved to: {output_dir}")
+    print(f"Results: {output_dir}")
     print(f"{'='*70}")
 
-    return final_result
+    return final
 
 
 def main():
-    parser = argparse.ArgumentParser(description="IROTE Full Optimization")
+    parser = argparse.ArgumentParser(description="IROTE Optimization")
 
-    # Model settings
+    # Model
     parser.add_argument("--model_name", type=str, default="MiMo-v2.5-Pro")
-    parser.add_argument("--eval_model_name", type=str, default=None,
-                        help="Judge model (defaults to model_name)")
 
-    # Trait settings
+    # Trait
     parser.add_argument("--evaluation_system", type=str, default="personality",
                         choices=["value", "personality", "moral"])
-    parser.add_argument("--specific_traits", type=str, default="extraversion",
-                        help="Comma-separated trait names")
+    parser.add_argument("--specific_traits", type=str, default="extraversion")
 
-    # IROTE hyperparameters (matching paper)
+    # IROTE hyperparameters (paper defaults)
     parser.add_argument("--max_iteration", type=int, default=5)
-    parser.add_argument("--init_reflection_num", type=int, default=10, help="K in paper")
-    parser.add_argument("--M1", type=int, default=3, help="Behaviors per candidate")
-    parser.add_argument("--M2", type=int, default=6, help="Responses per task")
-    parser.add_argument("--beta", type=float, default=1.0, help="Evocativeness weight")
+    parser.add_argument("--K", type=int, default=10, help="Candidate reflections (paper: 10)")
+    parser.add_argument("--M1", type=int, default=3, help="Behaviors per candidate (paper: 3)")
+    parser.add_argument("--M2", type=int, default=6, help="Responses per task (paper: 6)")
+    parser.add_argument("--beta", type=float, default=1.0, help="Evocativeness weight (paper: 1.0)")
     parser.add_argument("--words_limit", type=int, default=50, help="Max reflection words")
 
     # Output
     parser.add_argument("--output_dir", type=str, default="output/irote_results")
 
     args = parser.parse_args()
-    if args.eval_model_name is None:
-        args.eval_model_name = args.model_name
 
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Initialize router
     print(f"Initializing model: {args.model_name}")
     router = ModelRouter(
-        model_names=[args.model_name, args.eval_model_name],
+        model_names=[args.model_name],
         temperature=1.0,
         top_p=0.95,
         max_model_len=1024,
     )
 
-    # Initialize evaluator
-    evaluator = Evaluator(
-        router=router,
-        evaluation_system=args.evaluation_system,
-        tasks=["survey"],
-    )
-
-    # Run optimization for each trait
     traits = [t.strip() for t in args.specific_traits.split(",")]
     for trait in traits:
-        run_irote_optimization(args, trait, evaluator, router)
+        run_irote_optimization(args, trait, router)
 
 
 if __name__ == "__main__":
