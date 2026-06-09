@@ -8,14 +8,17 @@ from typing import List, Tuple
 from threading import Lock
 import numpy as np
 import re
-import torch
 
+# Try to import SimCSE (heavy dependency)
 try:
     from sentence_transformers import SentenceTransformer, util
     import faiss
+    import torch
+    SIMCSE_AVAILABLE = True
 except Exception as e:
-    print(e)
-    print("Warning: Please install sentence_transformers faiss-gpu to use the Retriever class.")
+    SIMCSE_AVAILABLE = False
+    print(f"[Info] sentence_transformers/faiss not fully available: {e}")
+    print("[Info] Retriever will use lightweight TF-IDF mode.")
 
 def softmax(x, temperature=1.0):
     if len(x) == 0:
@@ -24,114 +27,133 @@ def softmax(x, temperature=1.0):
     return e_x / e_x.sum(axis=0)
 
 class Retriever:
+    """
+    Retriever class for retrieving similar texts from a corpus.
+    Supports two modes:
+      - SimCSE mode: uses sentence-transformers + faiss (requires model download)
+      - TF-IDF mode: uses sklearn TfidfVectorizer (lightweight, no download needed)
+    """
     def __init__(self, model_name: str, corpus_texts: List[str], use_gpu: bool = False, save_path: str = None):
-        """Retriever class for retrieving similar texts from a corpus"""
-        self.model = SentenceTransformer(model_name, device='cuda' if use_gpu else 'cpu')
-        self.corpus_texts = corpus_texts
-        show_progress_bar = False# True if use_gpu else False
-        self.corpus_embeddings = self.model.encode(corpus_texts,  batch_size=1024, show_progress_bar=show_progress_bar) # True,
+        self.corpus_texts = list(corpus_texts)
         self.lock = Lock()
-        if use_gpu:
-            res = faiss.StandardGpuResources()
-            self.index = faiss.index_cpu_to_gpu(res, 0, faiss.IndexFlatIP(self.corpus_embeddings.shape[1]))
+        self.use_tfidf = not SIMCSE_AVAILABLE
+
+        if self.use_tfidf:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity
+            self._cosine_similarity = cosine_similarity
+            self._vectorizer = TfidfVectorizer(lowercase=True, stop_words='english')
+            self.corpus_embeddings = self._vectorizer.fit_transform(self.corpus_texts)
         else:
-            self.index = faiss.IndexFlatIP(self.corpus_embeddings.shape[1])
-        self.index.add(self.corpus_embeddings)
+            self.model = SentenceTransformer(model_name, device='cuda' if use_gpu else 'cpu')
+            self.corpus_embeddings = self.model.encode(corpus_texts, batch_size=1024, show_progress_bar=False)
+            if use_gpu:
+                res = faiss.StandardGpuResources()
+                self.index = faiss.index_cpu_to_gpu(res, 0, faiss.IndexFlatIP(self.corpus_embeddings.shape[1]))
+            else:
+                self.index = faiss.IndexFlatIP(self.corpus_embeddings.shape[1])
+            self.index.add(self.corpus_embeddings)
+
         if save_path:
             self.save_path = os.path.join(save_path, f"retriever.txt")
             self.save()
 
     def retrieve(self, query: str, top_k: int = 20, filter_texts: List[str] = []) -> List[Tuple[int, str, float]]:
-        query_embedding = self.model.encode([query], show_progress_bar=False)[0]
-        # top_k + len(filter_texts)
-    
-        _, idx = self.index.search(query_embedding.reshape(1, -1), top_k + len(filter_texts))
-        results = {
-            'idx': [],
-            'text': [],
-            'similarity': []
-        }
-        for i in range(top_k):
-            idx_i = idx[0][i]
-            text = self.corpus_texts[idx_i]
-            if text in filter_texts:
-                # if the retrieved text is in filter_texts, skip
-                continue
-            similarity = util.pytorch_cos_sim(query_embedding, self.corpus_embeddings[idx_i]).item()
-            results['idx'].append(idx_i)
-            results['text'].append(text)
-            results['similarity'].append(similarity)
-        return results
-    
+        if self.use_tfidf:
+            query_vec = self._vectorizer.transform([query])
+            similarities = self._cosine_similarity(query_vec, self.corpus_embeddings).flatten()
+            sorted_idx = np.argsort(similarities)[::-1]
+            results = {'idx': [], 'text': [], 'similarity': []}
+            for idx_i in sorted_idx:
+                if len(results['idx']) >= top_k:
+                    break
+                text = self.corpus_texts[idx_i]
+                if text in filter_texts:
+                    continue
+                results['idx'].append(idx_i)
+                results['text'].append(text)
+                results['similarity'].append(float(similarities[idx_i]))
+            return results
+        else:
+            query_embedding = self.model.encode([query], show_progress_bar=False)[0]
+            _, idx = self.index.search(query_embedding.reshape(1, -1), top_k + len(filter_texts))
+            results = {'idx': [], 'text': [], 'similarity': []}
+            for i in range(top_k):
+                idx_i = idx[0][i]
+                text = self.corpus_texts[idx_i]
+                if text in filter_texts:
+                    continue
+                similarity = util.pytorch_cos_sim(query_embedding, self.corpus_embeddings[idx_i]).item()
+                results['idx'].append(idx_i)
+                results['text'].append(text)
+                results['similarity'].append(similarity)
+            return results
+
     def add_corpus(self, new_corpus: List[str]):
         self.corpus_texts += new_corpus
-        new_corpus_embeddings = self.model.encode(new_corpus, batch_size=1024, show_progress_bar=False)
-        self.corpus_embeddings = np.vstack([self.corpus_embeddings, new_corpus_embeddings])
-        self.index.add(new_corpus_embeddings)
+        if self.use_tfidf:
+            self.corpus_embeddings = self._vectorizer.fit_transform(self.corpus_texts)
+        else:
+            new_corpus_embeddings = self.model.encode(new_corpus, batch_size=1024, show_progress_bar=False)
+            self.corpus_embeddings = np.vstack([self.corpus_embeddings, new_corpus_embeddings])
+            self.index.add(new_corpus_embeddings)
         self.save()
-    
+
     def dedup_and_add_corpus(self, new_corpus: List[str], threshold=0.85):
-        """
-        encode, calculate similarity, dedup and add corpus
-        """
-        new_corpus_embeddings = self.model.encode(new_corpus, show_progress_bar=False, batch_size=1024)
-        similarity_matrix = util.pytorch_cos_sim(new_corpus_embeddings, self.corpus_embeddings)
-        mask = similarity_matrix > threshold
-        deduped_texts = []
-        for i in range(len(new_corpus)):
-            if not mask[i].any():
-                deduped_texts.append(new_corpus[i])
+        if self.use_tfidf:
+            new_vecs = self._vectorizer.transform(new_corpus)
+            sim_matrix = self._cosine_similarity(new_vecs, self.corpus_embeddings)
+            deduped_texts = []
+            for i in range(len(new_corpus)):
+                if sim_matrix[i].max() <= threshold:
+                    deduped_texts.append(new_corpus[i])
+        else:
+            new_corpus_embeddings = self.model.encode(new_corpus, show_progress_bar=False, batch_size=1024)
+            similarity_matrix = util.pytorch_cos_sim(new_corpus_embeddings, self.corpus_embeddings)
+            mask = similarity_matrix > threshold
+            deduped_texts = []
+            for i in range(len(new_corpus)):
+                if not mask[i].any():
+                    deduped_texts.append(new_corpus[i])
         if len(deduped_texts) > 0:
             self.add_corpus(deduped_texts)
 
     def calculate_similarity(self, query: str, texts: List[str]) -> np.array:
-        """
-        calculate the similarity between query and texts
-        """
         if len(texts) == 0:
             return np.array([])
-        query_embedding = self.model.encode([query], show_progress_bar=False)[0]
-        text_embeddings = self.model.encode(texts, show_progress_bar=False, batch_size=1024)
-        similarity_scores = util.pytorch_cos_sim(query_embedding, text_embeddings)
-        return similarity_scores[0].cpu().numpy()
-    
+        if self.use_tfidf:
+            query_vec = self._vectorizer.transform([query])
+            text_vecs = self._vectorizer.transform(texts)
+            return self._cosine_similarity(query_vec, text_vecs).flatten()
+        else:
+            query_embedding = self.model.encode([query], show_progress_bar=False)[0]
+            text_embeddings = self.model.encode(texts, show_progress_bar=False, batch_size=1024)
+            similarity_scores = util.pytorch_cos_sim(query_embedding, text_embeddings)
+            return similarity_scores[0].cpu().numpy()
+
     def calculate_max_similarity(self, query: str, texts: List[str]) -> float:
-        """
-        calculate the max similarity between query and texts
-        """
         similarity_scores = self.calculate_similarity(query, texts)
         return np.max(similarity_scores) if len(similarity_scores) > 0 else 0
 
-    
     def calculated_weighted_similarity(self, similarities: List[float], temperature: float =1.0):
-        """
-        calculate softmax-weighted score
-        
-        Args:
-            scores (list or np.array): similarity scores of candidate texts
-            temperature (float, optional): temperature coefficient. default is 1.0
-            
-        Returns:
-            float: weighted score
-        """
         scores = np.array(similarities)
-        # 计算softmax分数
         weights = softmax(scores, temperature)
-        # 计算加权综合分数
         weighted_sum = np.sum(weights * scores)
         return weighted_sum
 
     def calculate_texts_mean_distance(self, texts: str):
-        """
-        caculate average similarity score
-        """
-        text_embeddings = self.model.encode(texts, show_progress_bar=False, batch_size=1024)
-        similarity_matrix = util.pytorch_cos_sim(text_embeddings, text_embeddings)
-        # mask self-similarity
-        mask = torch.eye(len(texts)).bool()
-        similarity_matrix[mask] = 0
-        mean_distance = 1 - similarity_matrix.mean().item()
-        return mean_distance
+        if self.use_tfidf:
+            text_vecs = self._vectorizer.transform(texts)
+            similarity_matrix = self._cosine_similarity(text_vecs, text_vecs)
+            np.fill_diagonal(similarity_matrix, 0)
+            return 1 - similarity_matrix.mean()
+        else:
+            text_embeddings = self.model.encode(texts, show_progress_bar=False, batch_size=1024)
+            similarity_matrix = util.pytorch_cos_sim(text_embeddings, text_embeddings)
+            mask = torch.eye(len(texts)).bool()
+            similarity_matrix[mask] = 0
+            mean_distance = 1 - similarity_matrix.mean().item()
+            return mean_distance
 
     def calculate_out_cluster_distance(self, in_cluster_texts: str):
         sum_distance = 0
@@ -139,7 +161,7 @@ class Retriever:
             res = self.retrieve(text, top_k=len(in_cluster_texts) - 1, filter_texts=in_cluster_texts)
             sum_distance += (1 - np.mean(res['similarity']))
         return sum_distance / len(in_cluster_texts)
-    
+
     def save(self, save_path: str = None):
         if hasattr(self, 'save_path') and save_path is None:
             with open(self.save_path, 'w') as f:
@@ -147,14 +169,15 @@ class Retriever:
         elif save_path:
             with open(save_path, 'w') as f:
                 f.write('\n'.join(self.corpus_texts))
-                
+
     @classmethod
     def load_corpus(cls, save_path: str):
         save_path = os.path.join(save_path, "retriever.txt")
         with open(save_path, 'r') as f:
             corpus_texts = [text.strip() for text in f.readlines()]
         return corpus_texts
-        
+
+
 
 def extract_quest(text):
     text = text.strip().strip('"')
@@ -578,6 +601,24 @@ def extract_value_score(text, threshold=7.5):
                 ret_value_dict[value] = score
     return list(ret_value), ret_value_dict
 
+def get_text_value_prompt(text: str) -> str:
+    """Generate a prompt for value prediction from text"""
+    schwartz_values = [
+        'Achievement', 'Benevolence', 'Conformity', 'Hedonism', 'Power',
+        'Security', 'Self-Direction', 'Stimulation', 'Tradition', 'Universalism'
+    ]
+    values_str = ", ".join(schwartz_values)
+    return f"""Analyze the following text and identify which Schwartz values it reflects.
+Values: {values_str}
+
+Text: {text}
+
+For each value, provide a score from 0 to 10 indicating how strongly the text reflects that value.
+Format: a. <Value>: <score>
+b. <Value>: <score>
+..."""
+
+
 class LLMEvaluator(ValueEvaluator):
     """Use LLM to predict values"""
     def __init__(self,  model_name, model_router, number_of_generations, value_threshold=7.5):
@@ -590,9 +631,9 @@ class LLMEvaluator(ValueEvaluator):
         """
         predict values for a batch of texts
         """
-        from prompts import get_text_value_prompt
         prompts = [get_text_value_prompt(text) for text in texts]
-        pred_texts = self.model_router.request_llm_single_turn(prompts, model=self.model_name, max_length=512, temperature=0.0)
+        messages = [[{"role": "user", "content": p}] for p in prompts]
+        pred_texts = self.model_router.request_llm(messages, model=self.model_name, max_length=512, temperature=0.0)
         text_values, value_dicts = [], []
         for text in pred_texts:
             value_list, value_dict = extract_value_score(text, self.value_threshold)
@@ -649,7 +690,8 @@ You are an AI assistant tasked with annotating whether a text reflects a specifi
             for value in self.values:
                 prompts.append(self.get_prompted_text(text, value))
         # predict
-        pred_texts = self.router.request_llm_single_turn(prompts, model=self.eval_model_name, max_length=100, temperature=0.0)
+        messages = [[{"role": "user", "content": p}] for p in prompts]
+        pred_texts = self.router.request_llm(messages, model=self.eval_model_name, max_length=100, temperature=0.0)
         # print(f"pred_texts: {len(pred_texts)}")
         # print(f"pred_texts: {pred_texts[0]}")
         def transform_yes_no(x):

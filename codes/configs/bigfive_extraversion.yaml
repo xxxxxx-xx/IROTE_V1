@@ -1,0 +1,56 @@
+# IROTE Experiment Config: BigFive - Extraversion
+# Paper: "IROTE: Human-Like Traits Elicitation of Large Language Model
+#         via In-Context Self-Reflective Optimization" (AAAI-26)
+
+experiment_name: bigfive_extraversion_mimo
+
+trait:
+  name: extraversion
+  system: personality
+  description: >
+    Extraversion reflects being energetic, talkative, assertive,
+    socially engaged, enthusiastic, and comfortable initiating interaction.
+  direction: high
+  positive_markers:
+    - initiates conversation
+    - expresses enthusiasm
+    - engages socially
+    - speaks assertively
+    - enjoys group interaction
+  negative_markers:
+    - avoids interaction
+    - remains passive
+    - withdraws from groups
+    - gives minimal responses
+
+models:
+  target_model: MiMo-v2.5-Pro
+  judge_model: MiMo-v2.5-Pro
+  optimizer_model: MiMo-v2.5-Pro
+
+irote:
+  K: 10                    # init_reflection_num (paper: 10)
+  M1: 3                    # behaviors per candidate (paper: 3)
+  M2: 6                    # responses per task (paper: 6)
+  T: 5                     # max iterations (paper: 5)
+  beta: 1.0                # evocativeness weight (paper: 1.0)
+  max_reflection_words: 50 # paper: 50 tokens
+  max_response_tokens: 1024
+  alpha_len: 0.1
+  alpha_dup: 0.1
+  gamma_stability: 0.3
+
+sampling:
+  init_temperature: 0.8
+  behavior_temperature: 0.9
+  response_temperature: 0.7
+  compact_temperature: 0.3
+  revise_temperature: 0.6
+  judge_temperature: 0.0
+
+tasks:
+  optimize:
+    - BFI (extraversion items)
+  eval:
+    - BFI-2 (extraversion items)
+    - open_generation (10 prompts)

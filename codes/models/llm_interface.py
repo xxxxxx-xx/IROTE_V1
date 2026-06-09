@@ -21,6 +21,16 @@ except Exception as e:
 
 from openai import OpenAI, AsyncOpenAI
 
+# Import centralized config for model names, ports, and API keys
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import (
+	GPT_ENDPOINT, AZURE_OPENAI_API_KEY, OPENAI_API_KEY,
+	MISTRAL_VLLM_NAME, MISTRAL_VLLM_PORT,
+	QWEN_VLLM_NAME, QWEN_VLLM_PORT,
+	GENERIC_API_MODELS,
+)
+
 class LLM(ABC):
 	# product
 	
@@ -38,7 +48,7 @@ class LLM(ABC):
 
 
 try:
-	url = os.getenv("GPT_ENDPOINT")
+	url = GPT_ENDPOINT
 	azure_model_map = {
 			"GPT-4o-Mini": "gpt-4o-mini",
 			'GPT-4o': "gpt-4o"
@@ -48,19 +58,19 @@ try:
 	async_aoiclient = AsyncAzureOpenAI(
 					azure_endpoint=url,
 					api_version="2024-12-01-preview",
-					api_key=os.environ.get("AZURE_OPENAI_API_KEY", ""),
+					api_key=AZURE_OPENAI_API_KEY,
 					max_retries=5
 	)
-	
+
 	aoiclient = AzureOpenAI(
 					azure_endpoint=url,
 					api_version="2024-12-01-preview",
-					api_key=os.environ.get("OPENAI_API_KEY", ""),
+					api_key=OPENAI_API_KEY,
 					max_retries=5
 	)
-	print("AzureOpenAI registered", f"{url}", f"{api_key}")
+	print(f"AzureOpenAI registered: endpoint={url}")
 
-	
+
 except Exception as e:
 	print("AzureOpenAI not registered", e)
 
@@ -455,6 +465,62 @@ class Qwen7B(VLLMOpenAIModel):
 		return client
 
 
+class GenericAPIModel(CustomOpenAIModel):
+	"""
+	Flexible model class for any OpenAI-compatible API endpoint.
+	Configured via config.GENERIC_API_MODELS dict.
+	Supports custom auth headers (e.g., for MiMo API).
+	"""
+	token_count = 0
+	lock = threading.Lock()
+	# These will be set dynamically during registration
+	model_name = ""
+	_base_url = ""
+	_api_key = ""
+	_auth_header = ""  # custom auth header value (e.g., for MiMo)
+
+	@classmethod
+	def get_setting(cls, async_=False):
+		# Use auth_header as api_key if available (sent as Authorization: Bearer <key>)
+		api_key = cls._auth_header if cls._auth_header else cls._api_key
+		if async_:
+			client = AsyncOpenAI(api_key=api_key, base_url=cls._base_url)
+		else:
+			client = OpenAI(api_key=api_key, base_url=cls._base_url)
+		return client
+
+
+def _register_generic_models():
+	"""
+	Dynamically register models from config.GENERIC_API_MODELS into PRODUCT_MAP.
+	This allows adding new closed-source models without modifying this file.
+	"""
+	for display_name, model_cfg in GENERIC_API_MODELS.items():
+		if display_name in PRODUCT_MAP:
+			continue  # skip if already registered
+		api_key = os.getenv(model_cfg.get("api_key_env", ""), model_cfg.get("api_key_env", ""))
+		base_url = model_cfg.get("base_url", "")
+		model_id = model_cfg.get("model_id", display_name)
+		auth_header = model_cfg.get("auth_header", "")
+
+		# Create a new class dynamically
+		new_class = type(
+			f"Generic_{display_name.replace('-', '_').replace('.', '_')}",
+			(GenericAPIModel,),
+			{
+				"model_name": model_id,
+				"_base_url": base_url,
+				"_api_key": api_key,
+				"_auth_header": auth_header,
+				"token_count": 0,
+				"lock": threading.Lock(),
+			}
+		)
+		PRODUCT_MAP[display_name] = new_class
+		chat_models.append(display_name)
+		print(f"Registered generic API model: {display_name} -> {model_id}")
+
+
 """
 Factory Method
 """
@@ -467,16 +533,19 @@ PRODUCT_MAP = {
 chat_models = ['GPT-4o-Mini', 'GPT-4o', "Qwen2.5-7B-Instruct", 'Mistral-7B-Instruct-v0.3']
 api_models = chat_models
 
+# Register any generic API models defined in config
+_register_generic_models()
+
 class LLMFactory:
 
 	@classmethod
 	def completion(cls, prompt, model_name, max_tokens=1000, temperature=1.0, **kwargs):
-		if model_name in completion_models:
+		if model_name in PRODUCT_MAP:
 			product = PRODUCT_MAP[model_name]
 			if temperature is not None:
-				return product.completion(prompt, max_tokens=max_tokens, temperature=temperature, **kwargs)
+				return product.process([{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature, **kwargs)
 			else:
-				return product.completion(prompt, max_tokens=max_tokens, **kwargs)
+				return product.process([{"role": "user", "content": prompt}], max_tokens=max_tokens, **kwargs)
 		else:
 			raise NotImplementedError(f"{model_name} Not implemented yet")
 	@classmethod
@@ -557,7 +626,16 @@ class LLMFactory:
 	@classmethod
 	def gather_multiple_models_n(cls, message, model_names,  n=1, **kwargs):
 		return asyncio.run(cls.gather_multiple_async_models_n(message, model_names, n=n, **kwargs))
-		
+
+	@classmethod
+	async def gather_multiple_async_messages_n(cls, messages, model_name, n=1, **kwargs):
+		"""input a list of messages, return a list of n responses per message"""
+		return await asyncio.gather(*[cls.process_n(message, model_name, n=n, **kwargs) for message in messages])
+
+	@classmethod
+	def gather_multiple_messages_n(cls, messages, model_name, n=1, **kwargs):
+		return asyncio.run(cls.gather_multiple_async_messages_n(messages, model_name, n=n, **kwargs))
+
 	@classmethod
 	def print_all_token_count(cls):
 		res_text = ""

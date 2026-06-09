@@ -1,28 +1,44 @@
 from typing import List
-from vllm import LLM, SamplingParams
-from transformers import AutoTokenizer
 import random
 from tqdm import tqdm
 random.seed(42)
 
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+    print("[Warning] vllm not installed. Local model inference is disabled. Use closed-source API models instead.")
+
+try:
+    from transformers import AutoTokenizer
+except ImportError:
+    pass
+
 class VLLMWrapper:
-    def __init__(self, model_path, 
+    def __init__(self, model_path,
                  pipeline_parallel_size=1,
-                 tensor_parallel_size=1, 
-                 gpu_memory_utilization=0.9, 
-                 max_model_len=8192, 
+                 tensor_parallel_size=1,
+                 gpu_memory_utilization=0.9,
+                 max_model_len=8192,
                  temperature=0,
                  top_p=0.95,
-                 max_tokens=2048, 
+                 max_tokens=2048,
                  ):
+        if not VLLM_AVAILABLE:
+            raise ImportError(
+                "vllm is not installed. Cannot use local model inference. "
+                "Please use closed-source API models (e.g., GPT-4o) instead, "
+                "or install vllm: pip install vllm"
+            )
         self.model_path = model_path
         self.model_name = self.model_path.split("/")[-1]
-        
-        self.model = LLM(model=model_path, 
+
+        self.model = LLM(model=model_path,
                          pipeline_parallel_size=pipeline_parallel_size,
-                         tensor_parallel_size=tensor_parallel_size, 
-                         gpu_memory_utilization=gpu_memory_utilization, 
-                         max_model_len=max_model_len, 
+                         tensor_parallel_size=tensor_parallel_size,
+                         gpu_memory_utilization=gpu_memory_utilization,
+                         max_model_len=max_model_len,
                          trust_remote_code=True)
         self.sampling_params = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
 

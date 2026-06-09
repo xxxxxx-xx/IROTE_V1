@@ -1,7 +1,9 @@
 import random
 from typing import List, Tuple
 random.seed(312)
+import os
 import re
+import json
 import pandas as pd
 from eval_utils import Evaluator
 import numpy as np
@@ -15,6 +17,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from eval_utils.controller import Controller
 from prompts import cot_optimize_reflections, optimize_reflections, summary_reflections
+from config import PATH_TO_SIMCSE_MODEL
 def extract_reflection(response):
     # extract 1. xxxxx \n 2. xxxxx \n 3. xxxxx
     return re.findall(r'\d+\.\s(.+)', response)

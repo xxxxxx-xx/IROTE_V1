@@ -1,10 +1,9 @@
 vllm
 transformers
 tqdm
-# flash-attn
 datasets
 anthropic
-openai
+openai>=1.0.0
 azure-core
 mistralai
 nltk
@@ -12,3 +11,7 @@ sentence-transformers
 pandas
 matplotlib
 seaborn
+numpy
+scipy
+faiss-cpu
+nest_asyncio

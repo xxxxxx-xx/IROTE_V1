@@ -1,5 +1,5 @@
-{   
-    "test_questionnaire": "MFQ-1", 
+{
+    "test_questionnaire": "MFQ-1",
     "shuffle_count": 1,
     "test_count": 1,
     "in_system": false,
@@ -7,5 +7,6 @@
     "batch_size": 20,
     "crowd_analysis": false,
     "temperature": 0.01,
-    "num_k_list": [1, 10, 20]
+    "data_names": [],
+    "num_k_list": [1]
 }
