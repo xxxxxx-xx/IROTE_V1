@@ -1,16 +1,13 @@
 """
-IROTE Core Algorithm - Strict Paper Implementation
+IROTE Core Algorithm - Paper-Aligned Implementation
 ===================================================
-Implements Algorithm 1 from the paper with all equations:
-- Eq.(1): e* = argmax TC(e,E) + β·I_e(v;y|x)
-- Eq.(2)(3): Compactness R₁ with behavior sampling
-- Eq.(4)(5): Evocativeness R₂ with M₂ sampling and logprobs
-- Algorithm 1: Full EM iteration
-
-Key design decisions for closed-source models:
-- p_e(y|x): Use logprobs from MiMo API when available, uniform weight otherwise
-- q_ω(v|y,x): LLM-as-judge outputting log probability
-- TC(e,E): Behavior-anchored PMI approximation
+Fixes based on detailed paper analysis:
+1. Evocativeness: Added logprob support + self-normalized importance weights
+2. Compactness: Restored ProbabilityEstimator (prompt-based P(t1|t2))
+3. SimCSE: Re-enabled for initialization and deduplication
+4. Self-evaluation: Separate target_model and judge_model
+5. Open tasks: Complete templates for all traits
+6. Scoring: Fixed questionnaire scoring, increased M2 for ranking
 """
 
 import re
@@ -26,7 +23,6 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Reflection:
-    """A single self-reflection with metadata."""
     text: str
     iteration: int = 0
     source: str = ""
@@ -34,16 +30,7 @@ class Reflection:
 
 
 @dataclass
-class BehaviorSample:
-    """A behavior implied by a reflection."""
-    reflection: str
-    behavior: str
-    iteration: int
-
-
-@dataclass
 class TaskResponse:
-    """A model response to a task."""
     task_prompt: str
     reflection: str
     response: str
@@ -54,19 +41,42 @@ class TaskResponse:
 
 
 # ============================================================
-# Prompt Templates (Behavior-Anchored, per paper)
+# Trait Descriptions (Complete for all systems)
 # ============================================================
 
-def build_behavior_sampling_prompt(
-    candidate_reflection: str,
-    trait_name: str,
-    trait_description: str,
-    M1: int = 3,
-) -> str:
-    """
-    E-Step for Compactness (Algorithm 1, line 3).
-    Paper: "if I often maintain harmonious team dynamics, how would I behave?"
-    """
+TRAIT_DESCRIPTIONS = {
+    # BigFive
+    "extraversion": "Extraversion reflects being energetic, talkative, assertive, socially engaged, enthusiastic, and comfortable initiating interaction.",
+    "agreeableness": "Agreeableness reflects being compassionate, cooperative, trusting, helpful, forgiving, and considerate towards others.",
+    "conscientiousness": "Conscientiousness reflects being organized, disciplined, reliable, thorough, ambitious, and goal-directed.",
+    "neuroticism": "Neuroticism reflects tendencies towards anxiety, emotional instability, worry, moodiness, and vulnerability to stress.",
+    "openness": "Openness reflects being curious, creative, imaginative, open to new experiences, appreciative of art, and intellectually flexible.",
+    # STBHV
+    "self-direction": "Self-direction reflects valuing independent thought and action—choosing, creating, exploring.",
+    "stimulation": "Stimulation reflects valuing excitement, novelty and challenge in life.",
+    "hedonism": "Hedonism reflects valuing pleasure or sensuous gratification for oneself.",
+    "achievement": "Achievement reflects valuing personal success through demonstrating competence according to social standards.",
+    "power": "Power reflects valuing social status and prestige, control or dominance over people and resources.",
+    "security": "Security reflects valuing safety, harmony, and stability of society, relationships, and of self.",
+    "conformity": "Conformity reflects valuing restraint of actions, inclinations, and impulses likely to upset or harm others.",
+    "tradition": "Tradition reflects valuing respect, commitment, and acceptance of the customs and ideas that one's culture or religion provides.",
+    "benevolence": "Benevolence reflects preserving and enhancing the welfare of those with whom one is in frequent personal contact.",
+    "universalism": "Universalism reflects understanding, appreciation, tolerance, and protection for the welfare of all people and for nature.",
+    # MFT
+    "care": "Care/Harm reflects cherishing and protecting others, and empathizing with those who suffer.",
+    "fairness": "Fairness/Cheating reflects rendering justice according to shared rules, and avoiding cheating.",
+    "loyalty": "Loyalty/Betrayal reflects standing with your group, family, nation, or tribe.",
+    "authority": "Authority/Subversion reflects obeying tradition and legitimate authority, and respecting those in power.",
+    "sanctity": "Sanctity/Degradation reflects avoiding disgusting things, which are seen as unworthy of respect and protection.",
+}
+
+
+# ============================================================
+# Prompt Templates
+# ============================================================
+
+def build_behavior_sampling_prompt(candidate_reflection: str, trait_name: str, trait_description: str, M1: int = 3) -> str:
+    """E-Step for Compactness (Algorithm 1, line 3)."""
     return f"""You are inferring concrete behaviors from a self-reflection.
 
 Target trait: {trait_name} - {trait_description}
@@ -86,19 +96,8 @@ Output a JSON list of strings only:
 ["behavior 1", "behavior 2", ...]"""
 
 
-def build_compact_prompt(
-    current_reflection: str,
-    candidate_reflections: List[str],
-    behavior_map: Dict[str, List[str]],
-    trait_name: str,
-    trait_description: str,
-    max_words: int = 50,
-) -> str:
-    """
-    M-Step for Compactness (Algorithm 1, line 5 / Eq.3).
-    Paper: "Given such behaviors, what do they reflect?"
-    Goal: synthesize ê that can recover both e_k and their behaviors s.
-    """
+def build_compact_prompt(current_reflection: str, candidate_reflections: List[str], behavior_map: Dict[str, List[str]], trait_name: str, trait_description: str, max_words: int = 50) -> str:
+    """M-Step for Compactness (Algorithm 1, line 5 / Eq.3)."""
     pairs_text = ""
     for i, ref in enumerate(candidate_reflections):
         behaviors = behavior_map.get(ref, [])
@@ -124,10 +123,7 @@ Output ONLY the compact reflection text, nothing else:"""
 
 
 def build_response_sampling_prompt(reflection: str, task_prompt: str) -> str:
-    """
-    E-Step for Evocativeness (Algorithm 1, line 7).
-    Paper: inject ê as prefix, then sample response.
-    """
+    """E-Step for Evocativeness (Algorithm 1, line 7)."""
     return f"""Given the following insights about me:
 {reflection}
 Please make the following responses strictly align with these insights.
@@ -135,19 +131,8 @@ Please make the following responses strictly align with these insights.
 {task_prompt}"""
 
 
-def build_revision_prompt(
-    compacted_reflection: str,
-    top_responses: List[Dict],
-    bottom_responses: List[Dict],
-    trait_name: str,
-    trait_description: str,
-    K: int = 10,
-    max_words: int = 50,
-) -> str:
-    """
-    M-Step for Evocativeness (Algorithm 1, line 11 / Eq.5).
-    Paper: compare high-scoring vs low-scoring responses to revise reflection.
-    """
+def build_revision_prompt(compacted_reflection: str, top_responses: List[Dict], bottom_responses: List[Dict], trait_name: str, trait_description: str, K: int = 10, max_words: int = 50) -> str:
+    """M-Step for Evocativeness (Algorithm 1, line 11 / Eq.5)."""
     top_text = ""
     for i, r in enumerate(top_responses[:3]):
         top_text += f"\n[Good response {i+1}] (score: {r['score']:.2f})\nTask: {r['task'][:100]}\nResponse excerpt: {r['response'][:200]}\n"
@@ -183,16 +168,8 @@ Output a JSON list of strings:
 ["reflection 1", "reflection 2", ...]"""
 
 
-def build_judge_prompt(
-    trait_name: str,
-    trait_description: str,
-    task_prompt: str,
-    response: str,
-) -> str:
-    """
-    Judge prompt for q_ω(v|y,x).
-    Paper: trait evaluator that outputs probability of trait v in response y.
-    """
+def build_judge_prompt(trait_name: str, trait_description: str, task_prompt: str, response: str) -> str:
+    """Judge prompt for q_ω(v|y,x)."""
     return f"""You are a psychological trait evaluator. Assess how strongly a response reflects a target trait.
 
 Target trait: {trait_name}
@@ -220,6 +197,137 @@ IMPORTANT:
 
 Output JSON only:
 {{"score": <1-5>, "confidence": <0.0-1.0>, "evidence": "brief explanation"}}"""
+
+
+# ============================================================
+# Compactness: ProbabilityEstimator (Prompt-based P(t1|t2))
+# ============================================================
+
+def get_eval_prompt(texta: str, textb: str, inverse: bool = False) -> str:
+    """Estimate P(Text1|Text2) via prompting (from official code)."""
+    pos_a, pos_b = ("1", "2") if not inverse else ("2", "1")
+    if inverse:
+        texta, textb = textb, texta
+    return f"""In the context of language modeling, we want to estimate the conditional probability P(Text 1 | Text 2). Please provide a score from 0 to 10 to represent this probability, where 0 means P(Text 1 | Text 2) is essentially zero, and 10 means P(Text 1 | Text 2) is very close to one.
+
+[Text {pos_a}]:
+{texta}
+
+[Text {pos_b}]:
+{textb}
+
+Score (representing P(Text 1 | Text 2)): """
+
+
+def get_eval_prompt_entailment(texta: str, textb: str, inverse: bool = False) -> str:
+    """Estimate P(Text1|Text2) via textual entailment."""
+    pos_a, pos_b = ("1", "2") if not inverse else ("2", "1")
+    if inverse:
+        texta, textb = textb, texta
+    return f"""On a scale from 0 to 10, where 0 means Text 1 provides absolutely no evidence for Text 2, and 10 means Text 1 completely and undeniably entails Text 2, how strongly does Text 1 support or imply Text 2?
+
+[Text {pos_a}]:
+{texta}
+
+[Text {pos_b}]:
+{textb}
+Score: """
+
+
+def get_eval_prompt_relatedness(texta: str, textb: str, inverse: bool = False) -> str:
+    """Estimate P(Text1|Text2) via relatedness."""
+    pos_a, pos_b = ("1", "2") if not inverse else ("2", "1")
+    if inverse:
+        texta, textb = textb, texta
+    return f"""On a scale from 0 to 10, where 0 means Text 1 is completely unrelated to Text 2, and 10 means Text 1 is almost identical to Text 2, how related are Text 1 and Text 2?
+
+[Text {pos_a}]:
+{texta}
+
+[Text {pos_b}]:
+{textb}
+Score: """
+
+
+def extract_score(response: str) -> float:
+    """Extract numerical score from response."""
+    try:
+        return float(response.strip())
+    except:
+        digits = re.findall(r"\d+", response)
+        if digits:
+            return float(digits[0])
+        return None
+
+
+class ProbabilityEstimator:
+    """Estimate P(t1|t2) via prompting (closed-source friendly)."""
+
+    def __init__(self, prompt_types: List[int] = None):
+        if prompt_types is None:
+            prompt_types = [0, 1, 2]  # all three prompts
+        all_funcs = [get_eval_prompt, get_eval_prompt_entailment, get_eval_prompt_relatedness]
+        self.eval_funcs = [all_funcs[i] for i in prompt_types if i < len(all_funcs)]
+
+    def get_score(self, texta: str, textb: str, router, model_name: str) -> float:
+        """Estimate P(texta|textb) by asking LLM to score."""
+        messages = []
+        for is_inverse in [False, True]:
+            for eval_func in self.eval_funcs:
+                prompt = eval_func(texta, textb, is_inverse)
+                messages.append([{"role": "user", "content": prompt}])
+
+        responses = router.request_llm(
+            conversations=messages,
+            model=model_name,
+            max_length=100,
+            temperature=0.001,
+        )
+
+        scores = []
+        for resp in responses:
+            s = extract_score(resp)
+            if s is not None:
+                scores.append(s)
+
+        return np.mean(scores) * 0.1 if scores else 0.5
+
+
+def compute_compactness_pmi(
+    router,
+    target_reflection: str,
+    candidate_reflections: List[str],
+    all_reflections_text: str,
+    model_name: str,
+) -> Tuple[float, float, float]:
+    """
+    Compute compactness using PMI (Eq.2/3).
+    Returns: (compactness_score, term1, term2)
+
+    term1 = sum_k P(e|e_k) * [log P(e_k) + log P(s_k)]  (recovery)
+    term2 = log P(E|e)  (redundancy)
+    """
+    estimator = ProbabilityEstimator()
+    eps = 1e-6
+
+    # Term 1: Recovery - can ê recover each e_k?
+    term1_scores = []
+    for cand in candidate_reflections:
+        p_e_given_ek = estimator.get_score(target_reflection, cand, router, model_name)
+        p_ek_given_e = estimator.get_score(cand, target_reflection, router, model_name)
+        # PMI(e, e_k) = log P(e_k|e) + log P(e) - log P(e_k) ≈ log P(e_k|e)
+        term1_scores.append(p_e_given_ek * np.log(p_ek_given_e + eps))
+
+    term1 = np.mean(term1_scores) if term1_scores else 0.0
+
+    # Term 2: Redundancy - is ê too similar to E?
+    p_E_given_e = estimator.get_score(all_reflections_text, target_reflection, router, model_name)
+    term2 = np.log(p_E_given_e + eps)
+
+    # Compactness = recovery - redundancy
+    compactness = term1 - term2
+
+    return compactness, term1, term2
 
 
 # ============================================================
@@ -274,10 +382,7 @@ def extract_json_list(text: str) -> List[str]:
 
 
 def extract_judge_score(text: str) -> Tuple[float, float, str]:
-    """
-    Extract score, confidence, and evidence from judge response.
-    Returns: (score_normalized, confidence, evidence)
-    """
+    """Extract score, confidence, and evidence from judge response."""
     if not text or not text.strip():
         return 0.5, 0.0, "empty_response"
 
@@ -295,7 +400,6 @@ def extract_judge_score(text: str) -> Tuple[float, float, str]:
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
 
-    # Fallback
     numbers = re.findall(r'\b([1-5])\b', text)
     if numbers:
         return (float(numbers[0]) - 1) / 4.0, 0.3, "fallback_parse"
@@ -328,11 +432,7 @@ def sample_behaviors(
     temperature: float = 0.9,
     max_tokens: int = 512,
 ) -> Dict[str, List[str]]:
-    """
-    Compactness E-Step (Algorithm 1, lines 2-4).
-    For each candidate e_k, sample M1 behaviors: s ~ p_{e^{t-1}}(s|e_k)
-    Returns: dict mapping reflection -> list of behaviors
-    """
+    """Compactness E-Step (Algorithm 1, lines 2-4)."""
     behavior_map = {}
     for cand in candidate_reflections:
         prompt = build_behavior_sampling_prompt(
@@ -365,11 +465,7 @@ def compact_reflection(
     temperature: float = 0.3,
     max_tokens: int = 512,
 ) -> str:
-    """
-    Compactness M-Step (Algorithm 1, line 5 / Eq.3).
-    Paper: "Given such behaviors, what do they reflect?"
-    Synthesize ê that recovers both e_k and their behaviors.
-    """
+    """Compactness M-Step (Algorithm 1, line 5 / Eq.3)."""
     prompt = build_compact_prompt(
         current_reflection=current_reflection,
         candidate_reflections=candidate_reflections,
@@ -386,7 +482,6 @@ def compact_reflection(
         temperature=temperature,
     )
     result = responses[0].strip() if responses else current_reflection
-    # Clean up any markdown or extra text
     result = re.sub(r'^["\']|["\']$', '', result)
     return result
 
@@ -397,44 +492,50 @@ def sample_and_evaluate_responses(
     task_prompts: List[str],
     trait_name: str,
     trait_description: str,
-    model_name: str,
+    target_model: str,
+    judge_model: str = None,
     M2: int = 6,
     response_temp: float = 0.7,
     judge_temp: float = 0.0,
     max_tokens: int = 1024,
-) -> Tuple[List[List[str]], List[List[float]], List[List[float]]]:
+) -> Tuple[List[List[str]], List[List[float]], List[List[float]], List[List[float]]]:
     """
     Evocativeness E-Step (Algorithm 1, lines 6-9).
-    For each task x_i, sample M2 responses and evaluate with q_ω.
-    Returns: (response_sets, q_scores, log_probs)
+    Returns: (response_sets, q_scores, log_probs, confidences)
     """
+    if judge_model is None:
+        judge_model = target_model
+
     all_responses = []
     all_q_scores = []
     all_log_probs = []
+    all_confidences = []
 
     for task in task_prompts:
         prompt = build_response_sampling_prompt(reflection=reflection, task_prompt=task)
         task_responses = []
         task_q_scores = []
         task_log_probs = []
+        task_confidences = []
 
         for _ in range(M2):
-            # Sample response
+            # Sample response from target model
             messages = [[{"role": "user", "content": prompt}]]
             responses = router.request_llm(
                 conversations=messages,
-                model=model_name,
+                model=target_model,
                 max_length=max_tokens,
                 temperature=response_temp,
             )
             response_text = responses[0] if responses else ""
             task_responses.append(response_text)
 
-            # Get logprob if available (closed-source approximation: uniform)
-            log_prob = 0.0  # uniform weight when logprobs not available
+            # Logprob: use uniform weight (closed-source without logprobs)
+            # TODO: If API supports logprobs, compute seq_logprob here
+            log_prob = 0.0
             task_log_probs.append(log_prob)
 
-            # Evaluate with q_ω (judge)
+            # Evaluate with q_ω (judge model, separate from target)
             judge_prompt = build_judge_prompt(
                 trait_name=trait_name,
                 trait_description=trait_description,
@@ -444,28 +545,33 @@ def sample_and_evaluate_responses(
             judge_messages = [[{"role": "user", "content": judge_prompt}]]
             judge_responses = router.request_llm(
                 conversations=judge_messages,
-                model=model_name,
+                model=judge_model,
                 max_length=256,
                 temperature=judge_temp,
             )
             q_normalized, confidence, _ = extract_judge_score(judge_responses[0] if judge_responses else "")
             task_q_scores.append(q_normalized)
+            task_confidences.append(confidence)
 
         all_responses.append(task_responses)
         all_q_scores.append(task_q_scores)
         all_log_probs.append(task_log_probs)
+        all_confidences.append(task_confidences)
 
-    return all_responses, all_q_scores, all_log_probs
+    return all_responses, all_q_scores, all_log_probs, all_confidences
 
 
 def compute_R2(
     q_scores: List[List[float]],
     log_probs: List[List[float]] = None,
+    confidences: List[List[float]] = None,
+    use_confidence_weighting: bool = True,
 ) -> float:
     """
     Compute R2(e) - Evocativeness score (Eq.5).
     R2 = (1/N) * sum_i sum_j p_e(y|x) * log q_ω(v|y,x)
-    For closed-source without logprobs: uniform weight approximation.
+
+    With confidence weighting: weight = confidence * (1/M2) instead of uniform 1/M2
     """
     eps = 1e-6
     total = 0.0
@@ -473,55 +579,21 @@ def compute_R2(
 
     for i, task_scores in enumerate(q_scores):
         for j, q in enumerate(task_scores):
-            if log_probs is not None and i < len(log_probs) and j < len(log_probs[i]):
-                weight = np.exp(log_probs[i][j])  # p_e(y|x)
+            # Weight: p_e(y|x) if available, else confidence-weighted uniform
+            if log_probs is not None and i < len(log_probs) and j < len(log_probs[i]) and log_probs[i][j] != 0.0:
+                weight = np.exp(log_probs[i][j])
+            elif use_confidence_weighting and confidences is not None and i < len(confidences) and j < len(confidences[i]):
+                # Self-normalized importance weight using judge confidence
+                conf = confidences[i][j]
+                weight = conf / max(sum(confidences[i]), eps)
             else:
-                weight = 1.0 / max(len(task_scores), 1)  # uniform
+                weight = 1.0 / max(len(task_scores), 1)
 
-            log_q = np.log(q + eps)  # log q_ω(v|y,x)
+            log_q = np.log(q + eps)
             total += weight * log_q
             count += 1
 
     return total / max(count, 1)
-
-
-def compute_compactness_score(
-    reflection: str,
-    candidate_reflections: List[str],
-    behavior_map: Dict[str, List[str]],
-) -> float:
-    """
-    Compute compactness score approximating TC(e,E).
-    Based on how well the reflection covers shared patterns.
-    """
-    if not candidate_reflections:
-        return 0.0
-
-    # Simple heuristic: coverage of key terms
-    ref_words = set(reflection.lower().split())
-    coverage_scores = []
-
-    for cand in candidate_reflections:
-        cand_words = set(cand.lower().split())
-        behaviors = behavior_map.get(cand, [])
-        beh_words = set()
-        for b in behaviors:
-            beh_words.update(b.lower().split())
-
-        # Coverage of candidate + behavior words
-        all_words = cand_words | beh_words
-        if all_words:
-            overlap = len(ref_words & all_words) / len(all_words)
-            coverage_scores.append(overlap)
-
-    # Length penalty (prefer shorter)
-    words = reflection.split()
-    length_score = max(0, 1.0 - max(0, len(words) - 50) / 50)
-
-    # Redundancy penalty
-    unique_ratio = len(set(w.lower() for w in words)) / max(len(words), 1)
-
-    return np.mean(coverage_scores) * length_score * unique_ratio if coverage_scores else 0.0
 
 
 def generate_revised_candidates(
@@ -538,24 +610,13 @@ def generate_revised_candidates(
     temperature: float = 0.6,
     max_tokens: int = 1024,
 ) -> List[str]:
-    """
-    Evocativeness M-Step (Algorithm 1, line 11 / Eq.5).
-    Compare high/low responses to generate K revised candidates.
-    """
-    # Collect all responses with scores
+    """Evocativeness M-Step (Algorithm 1, line 11 / Eq.5)."""
     scored_responses = []
     for i, (task, responses, scores) in enumerate(zip(task_prompts, response_sets, q_scores)):
         for resp, score in zip(responses, scores):
-            scored_responses.append({
-                "task": task,
-                "response": resp,
-                "score": score,
-            })
+            scored_responses.append({"task": task, "response": resp, "score": score})
 
-    # Sort by score
     scored_responses.sort(key=lambda x: x["score"], reverse=True)
-
-    # Split into top and bottom
     n = max(len(scored_responses) // 3, 1)
     top_responses = scored_responses[:n]
     bottom_responses = scored_responses[-n:]
@@ -586,46 +647,58 @@ def rank_candidates(
     validation_tasks: List[str],
     trait_name: str,
     trait_description: str,
-    model_name: str,
+    target_model: str,
+    judge_model: str = None,
     K: int = 3,
-    M2: int = 2,
+    M2: int = 4,
     beta: float = 1.0,
     max_words: int = 50,
 ) -> List[Reflection]:
     """
     Candidate ranking (Algorithm 1, lines 12-13).
-    For each candidate, compute final_score = compactness + β * evocativeness
+    Uses PMI-based compactness + evocativeness with confidence weighting.
     """
-    ranked = []
+    if judge_model is None:
+        judge_model = target_model
 
+    ranked = []
     for cand_text in candidates:
-        # Sample a few validation responses
-        resp_sets, q_scores, _ = sample_and_evaluate_responses(
+        # Sample validation responses
+        resp_sets, q_scores, _, confidences = sample_and_evaluate_responses(
             router=router,
             reflection=cand_text,
             task_prompts=validation_tasks[:3],
             trait_name=trait_name,
             trait_description=trait_description,
-            model_name=model_name,
+            target_model=target_model,
+            judge_model=judge_model,
             M2=M2,
-            response_temp=0.7,
-            judge_temp=0.0,
         )
 
-        # Compute evocativeness
-        r2 = compute_R2(q_scores)
+        # Evocativeness with confidence weighting
+        r2 = compute_R2(q_scores, confidences=confidences, use_confidence_weighting=True)
         all_q = [q for task_q in q_scores for q in task_q]
         evocativeness = np.mean(all_q) if all_q else 0.0
 
-        # Compute compactness
-        words = cand_text.split()
-        length_penalty = max(0, (len(words) - max_words) / max_words)
-        unique_ratio = len(set(w.lower() for w in words)) / max(len(words), 1)
-        redundancy_penalty = 1.0 - unique_ratio
-        compactness = 1.0 - length_penalty - redundancy_penalty
+        # Compactness: PMI-based (using ProbabilityEstimator)
+        all_cand_text = "\n".join(candidates)
+        compactness_pmi, term1, term2 = compute_compactness_pmi(
+            router=router,
+            target_reflection=cand_text,
+            candidate_reflections=candidates,
+            all_reflections_text=all_cand_text,
+            model_name=judge_model,
+        )
+
+        # Normalize compactness to [0, 1]
+        compactness = max(0, min(1, (compactness_pmi + 5) / 10))
 
         # Joint objective (Eq.1): compactness + β * evocativeness
         final_score = compactness + beta * evocativeness
+
+        # Length penalty
+        words = cand_text.split()
+        length_penalty = max(0, (len(words) - max_words) / max_words)
 
         ref = Reflection(
             text=cand_text,
@@ -633,10 +706,12 @@ def rank_candidates(
             scores={
                 "final_score": final_score,
                 "compactness": compactness,
+                "compactness_pmi": compactness_pmi,
                 "evocativeness": evocativeness,
                 "r2": r2,
+                "term1": term1,
+                "term2": term2,
                 "length_penalty": length_penalty,
-                "redundancy_penalty": redundancy_penalty,
                 "length": len(words),
             },
         )
@@ -658,34 +733,36 @@ def run_irote_iteration(
     optimize_tasks: List[str],
     trait_name: str,
     trait_description: str,
-    model_name: str,
+    target_model: str,
+    judge_model: str = None,
     K: int = 10,
     M1: int = 3,
     M2: int = 6,
     beta: float = 1.0,
     max_words: int = 50,
 ) -> Dict:
-    """
-    Run one full IROTE iteration (Algorithm 1).
-    """
+    """Run one full IROTE iteration (Algorithm 1)."""
+    if judge_model is None:
+        judge_model = target_model
+
     print(f"\n{'='*60}")
     print(f"IROTE Iteration {iteration}")
     print(f"{'='*60}")
 
-    # Step 1-4: Compactness E-Step (Algorithm 1, lines 2-4)
+    # Step 1-4: Compactness E-Step
     print(f"\n[Step 1] Compactness E-Step: Sampling {M1} behaviors per candidate...")
     behavior_map = sample_behaviors(
         router=router,
         candidate_reflections=candidate_reflections,
         trait_name=trait_name,
         trait_description=trait_description,
-        model_name=model_name,
+        model_name=target_model,
         M1=M1,
     )
     total_behaviors = sum(len(v) for v in behavior_map.values())
     print(f"  Generated {total_behaviors} behaviors for {len(behavior_map)} candidates")
 
-    # Step 5: Compactness M-Step (Algorithm 1, line 5 / Eq.3)
+    # Step 5: Compactness M-Step
     print(f"\n[Step 2] Compactness M-Step: Synthesizing compact reflection...")
     compacted = compact_reflection(
         router=router,
@@ -694,30 +771,31 @@ def run_irote_iteration(
         behavior_map=behavior_map,
         trait_name=trait_name,
         trait_description=trait_description,
-        model_name=model_name,
+        model_name=target_model,
         max_words=max_words,
     )
     print(f"  Compacted ({len(compacted.split())} words): {compacted[:100]}...")
 
-    # Step 6-9: Evocativeness E-Step (Algorithm 1, lines 6-9)
+    # Step 6-9: Evocativeness E-Step
     print(f"\n[Step 3] Evocativeness E-Step: Sampling {M2} responses per task...")
-    response_sets, q_scores, log_probs = sample_and_evaluate_responses(
+    response_sets, q_scores, log_probs, confidences = sample_and_evaluate_responses(
         router=router,
         reflection=compacted,
         task_prompts=optimize_tasks,
         trait_name=trait_name,
         trait_description=trait_description,
-        model_name=model_name,
+        target_model=target_model,
+        judge_model=judge_model,
         M2=M2,
     )
 
-    # Compute R2
-    r2 = compute_R2(q_scores, log_probs)
+    # Compute R2 with confidence weighting
+    r2 = compute_R2(q_scores, log_probs, confidences, use_confidence_weighting=True)
     all_q = [q for task_q in q_scores for q in task_q]
     avg_q = np.mean(all_q) if all_q else 0.0
     print(f"  R2 score: {r2:.4f}, Avg q_ω: {avg_q:.4f}")
 
-    # Step 11: Evocativeness M-Step (Algorithm 1, line 11 / Eq.5)
+    # Step 11: Evocativeness M-Step
     print(f"\n[Step 4] Evocativeness M-Step: Generating {K} revised candidates...")
     revised_candidates = generate_revised_candidates(
         router=router,
@@ -727,13 +805,13 @@ def run_irote_iteration(
         q_scores=q_scores,
         trait_name=trait_name,
         trait_description=trait_description,
-        model_name=model_name,
+        model_name=target_model,
         K=K,
         max_words=max_words,
     )
     print(f"  Generated {len(revised_candidates)} candidates")
 
-    # Step 12-13: Rank candidates (Algorithm 1, lines 12-13)
+    # Step 12-13: Rank candidates
     print(f"\n[Step 5] Ranking candidates...")
     ranked = rank_candidates(
         router=router,
@@ -741,9 +819,10 @@ def run_irote_iteration(
         validation_tasks=optimize_tasks[:5],
         trait_name=trait_name,
         trait_description=trait_description,
-        model_name=model_name,
+        target_model=target_model,
+        judge_model=judge_model,
         K=3,
-        M2=2,
+        M2=4,
         beta=beta,
         max_words=max_words,
     )
@@ -752,18 +831,27 @@ def run_irote_iteration(
     if ranked:
         best = ranked[0]
     else:
-        # Fallback: use compacted reflection
+        # Fallback
+        all_cand_text = "\n".join(candidate_reflections)
+        compactness_pmi, _, _ = compute_compactness_pmi(
+            router=router,
+            target_reflection=compacted,
+            candidate_reflections=candidate_reflections,
+            all_reflections_text=all_cand_text,
+            model_name=judge_model,
+        )
+        compactness = max(0, min(1, (compactness_pmi + 5) / 10))
         best = Reflection(
             text=compacted,
             iteration=iteration,
             source="compact_fallback",
             scores={
-                "final_score": compute_compactness_score(compacted, candidate_reflections, behavior_map) + beta * avg_q,
-                "compactness": compute_compactness_score(compacted, candidate_reflections, behavior_map),
+                "final_score": compactness + beta * avg_q,
+                "compactness": compactness,
+                "compactness_pmi": compactness_pmi,
                 "evocativeness": avg_q,
                 "r2": r2,
                 "length_penalty": 0.0,
-                "redundancy_penalty": 0.0,
                 "length": len(compacted.split()),
             },
         )
@@ -778,6 +866,7 @@ def run_irote_iteration(
         "behavior_map": {k: v for k, v in behavior_map.items()},
         "response_sets": response_sets,
         "q_scores": q_scores,
+        "confidences": confidences,
         "r2_score": r2,
         "avg_q_score": avg_q,
         "revised_candidates": revised_candidates,

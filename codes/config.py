@@ -13,6 +13,11 @@ Usage:
 """
 
 import os
+from dotenv import load_dotenv
+
+# Load .env file from project root
+_env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+load_dotenv(_env_path)
 
 # ============================================================
 # 1. Path Configuration
