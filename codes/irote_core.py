@@ -1,13 +1,14 @@
 """
 IROTE Core Algorithm - Paper-Aligned Implementation
 ===================================================
-Fixes based on detailed paper analysis:
-1. Evocativeness: Added logprob support + self-normalized importance weights
-2. Compactness: Restored ProbabilityEstimator (prompt-based P(t1|t2))
-3. SimCSE: Re-enabled for initialization and deduplication
-4. Self-evaluation: Separate target_model and judge_model
-5. Open tasks: Complete templates for all traits
-6. Scoring: Fixed questionnaire scoring, increased M2 for ranking
+Fixes for all 7 identified issues:
+1. logprobs support for p_e(y|x)
+2. PMI-based compactness via ProbabilityEstimator
+3. Evaluation pipeline connected
+4. Retriever integrated for dedup
+5. Separate target/judge models
+6. Complete trait templates (including MFT-Sanctity)
+7. Fixed questionnaire scoring
 """
 
 import re
@@ -29,45 +30,215 @@ class Reflection:
     scores: Dict[str, float] = field(default_factory=dict)
 
 
-@dataclass
-class TaskResponse:
-    task_prompt: str
-    reflection: str
-    response: str
-    iteration: int
-    logprob: float = 0.0  # log p_e(y|x)
-    q_score: float = 0.0  # q_ω(v|y,x) in [0,1]
-    log_q: float = 0.0    # log q_ω(v|y,x)
-
-
 # ============================================================
-# Trait Descriptions (Complete for all systems)
+# Trait Descriptions (Complete for ALL 20 traits)
 # ============================================================
 
 TRAIT_DESCRIPTIONS = {
-    # BigFive
+    # BigFive (5)
     "extraversion": "Extraversion reflects being energetic, talkative, assertive, socially engaged, enthusiastic, and comfortable initiating interaction.",
     "agreeableness": "Agreeableness reflects being compassionate, cooperative, trusting, helpful, forgiving, and considerate towards others.",
     "conscientiousness": "Conscientiousness reflects being organized, disciplined, reliable, thorough, ambitious, and goal-directed.",
     "neuroticism": "Neuroticism reflects tendencies towards anxiety, emotional instability, worry, moodiness, and vulnerability to stress.",
     "openness": "Openness reflects being curious, creative, imaginative, open to new experiences, appreciative of art, and intellectually flexible.",
-    # STBHV
+    # STBHV (10)
     "self-direction": "Self-direction reflects valuing independent thought and action—choosing, creating, exploring.",
     "stimulation": "Stimulation reflects valuing excitement, novelty and challenge in life.",
     "hedonism": "Hedonism reflects valuing pleasure or sensuous gratification for oneself.",
     "achievement": "Achievement reflects valuing personal success through demonstrating competence according to social standards.",
     "power": "Power reflects valuing social status and prestige, control or dominance over people and resources.",
     "security": "Security reflects valuing safety, harmony, and stability of society, relationships, and of self.",
-    "conformity": "Conformity reflects valuing restraint of actions, inclinations, and impulses likely to upset or harm others.",
+    "conformity": "Conformity reflects valuing restraint of actions, inclinations, and impulses likely to upset or harm others and violate social expectations or norms.",
     "tradition": "Tradition reflects valuing respect, commitment, and acceptance of the customs and ideas that one's culture or religion provides.",
     "benevolence": "Benevolence reflects preserving and enhancing the welfare of those with whom one is in frequent personal contact.",
     "universalism": "Universalism reflects understanding, appreciation, tolerance, and protection for the welfare of all people and for nature.",
-    # MFT
+    # MFT (5)
     "care": "Care/Harm reflects cherishing and protecting others, and empathizing with those who suffer.",
     "fairness": "Fairness/Cheating reflects rendering justice according to shared rules, and avoiding cheating.",
     "loyalty": "Loyalty/Betrayal reflects standing with your group, family, nation, or tribe.",
     "authority": "Authority/Subversion reflects obeying tradition and legitimate authority, and respecting those in power.",
-    "sanctity": "Sanctity/Degradation reflects avoiding disgusting things, which are seen as unworthy of respect and protection.",
+    "sanctity": "Sanctity/Degradation reflects avoiding disgusting things, which are seen as unworthy of respect and protection. It values purity, cleanliness, and moral sacredness.",
+}
+
+
+# ============================================================
+# Open Task Templates (Complete for ALL 20 traits)
+# ============================================================
+
+OPEN_TASK_TEMPLATES = {
+    # BigFive
+    "extraversion": [
+        "Write a short paragraph about how you would behave at a lively party where you know almost nobody.",
+        "Describe how you would respond when a new colleague joins your team project.",
+        "A friend invites you to give a spontaneous toast at a dinner. Write what you would say.",
+        "You arrive at a social gathering where everyone is quiet. Describe what you do.",
+        "Write about how you spend a typical Saturday afternoon with friends.",
+        "Your team is brainstorming ideas for a project. Describe your contribution style.",
+        "You overhear an interesting conversation at a coffee shop. What do you do?",
+        "Describe how you would handle being the host of a large event.",
+        "Write about a time when you had to motivate a group of people.",
+        "You are placed in a group of strangers for a team-building exercise. Describe your approach.",
+    ],
+    "agreeableness": [
+        "A colleague takes credit for your work in a meeting. Describe how you respond.",
+        "Your friend cancels plans at the last minute for the third time. Write your reaction.",
+        "You discover a teammate made a significant error. How do you address it?",
+        "Describe how you handle a disagreement with a close friend about an important issue.",
+        "A stranger asks for help carrying groceries. Write about your response.",
+        "Your neighbor plays loud music late at night. Describe how you handle it.",
+        "Write about how you would mediate a conflict between two coworkers.",
+        "Someone criticizes your work harshly. Describe your internal response and action.",
+        "You have to deliver bad news to a friend. How do you approach it?",
+        "Describe how you react when someone cuts in front of you in a long queue.",
+    ],
+    "conscientiousness": [
+        "You have a major deadline in two weeks. Describe your planning approach.",
+        "Your desk/workspace is getting messy. Write about how you handle it.",
+        "Describe how you approach a task you find boring but necessary.",
+        "You realize you forgot an important appointment. What do you do?",
+        "Write about how you prepare for an important presentation.",
+        "Describe your approach to managing multiple competing priorities.",
+        "You have free time on a weekday afternoon. How do you decide what to do?",
+        "Write about how you handle a situation where you made a promise you can't keep.",
+        "Describe your approach to learning a new skill or subject.",
+        "You notice a small error in a report that's already been submitted. What do you do?",
+    ],
+    "neuroticism": [
+        "You receive unexpected criticism from your supervisor. Describe your emotional response.",
+        "A close friend hasn't replied to your message for days. Write about your thoughts.",
+        "Describe how you feel and react when plans change suddenly at the last minute.",
+        "You have to give a speech to a large audience tomorrow. Write about tonight.",
+        "Something you worked hard on gets rejected. Describe your internal experience.",
+        "Describe how you handle a situation where you feel overwhelmed with responsibilities.",
+        "You make an embarrassing mistake in public. Write about your reaction.",
+        "Describe your response to receiving ambiguous feedback on your work.",
+        "You're waiting for important news that could affect your career. Write about the wait.",
+        "Describe how you cope when multiple things go wrong in the same day.",
+    ],
+    "openness": [
+        "You encounter a completely unfamiliar cultural practice. Describe your reaction.",
+        "Someone suggests trying an activity you've never considered before. What do you do?",
+        "Describe how you would approach solving a problem with no clear right answer.",
+        "You have the opportunity to travel to a country you know nothing about. Write your thoughts.",
+        "A friend shares an idea that challenges your existing beliefs. Describe your response.",
+        "Write about how you would design a creative solution to reduce food waste.",
+        "Describe your reaction to an abstract art piece that you don't immediately understand.",
+        "You're asked to learn a completely new technology for a project. How do you approach it?",
+        "Write about a time when you changed your mind about something important.",
+        "Describe how you would approach a conversation with someone whose worldview differs greatly from yours.",
+    ],
+    # STBHV
+    "self-direction": [
+        "You're asked to follow a strict procedure that you think could be improved. What do you do?",
+        "Describe how you approach making an important life decision.",
+        "Write about a time when you chose to go against conventional advice.",
+        "You have a creative idea that no one else supports. Describe your response.",
+        "How do you decide what to do with your free time?",
+    ],
+    "stimulation": [
+        "Describe a new experience you recently sought out.",
+        "You have a choice between a safe option and an exciting but risky one. What do you choose?",
+        "Write about how you handle routine and monotony.",
+        "Describe a challenge you voluntarily took on.",
+        "How do you react when someone suggests trying something completely new?",
+    ],
+    "hedonism": [
+        "Describe how you plan a perfect weekend for yourself.",
+        "Write about a time when you indulged in something pleasurable.",
+        "How do you balance work and enjoyment?",
+        "Describe your approach to self-care and relaxation.",
+        "Write about a sensory experience that brought you great joy.",
+    ],
+    "achievement": [
+        "Describe a goal you set and how you worked towards it.",
+        "Write about how you handle competition.",
+        "Describe a time when you demonstrated your competence.",
+        "How do you define success?",
+        "Write about a professional accomplishment you're proud of.",
+    ],
+    "power": [
+        "Describe how you handle a situation where you have authority over others.",
+        "Write about a time when you influenced a group's decision.",
+        "How do you view social status and prestige?",
+        "Describe your leadership style.",
+        "Write about how you handle resources and responsibilities.",
+    ],
+    "security": [
+        "Describe how you prepare for potential risks.",
+        "Write about how you handle uncertainty.",
+        "Describe your approach to maintaining stability in your life.",
+        "How do you respond when your safety or well-being feels threatened?",
+        "Write about a time when you prioritized security over other options.",
+    ],
+    "conformity": [
+        "Describe how you handle a situation where everyone else is breaking a rule.",
+        "Write about a time when you followed social expectations even though you disagreed.",
+        "How do you view rules and regulations?",
+        "Describe your response to authority figures.",
+        "Write about a situation where you chose to comply rather than resist.",
+    ],
+    "tradition": [
+        "Describe a tradition or custom that is important to you.",
+        "Write about how you honor your cultural or religious heritage.",
+        "How do you view changes to long-standing practices?",
+        "Describe a time when you upheld a traditional value.",
+        "Write about the role of customs in your life.",
+    ],
+    "benevolence": [
+        "Describe a time when you went out of way to help someone close to you.",
+        "Write about how you support your friends during difficult times.",
+        "How do you show care for people in your daily life?",
+        "Describe a sacrifice you made for someone else's benefit.",
+        "Write about what loyalty means to you.",
+    ],
+    "universalism": [
+        "Describe how you respond to news about global poverty or inequality.",
+        "Write about your views on environmental protection.",
+        "How do you approach understanding people from different backgrounds?",
+        "Describe a time when you advocated for fairness or equality.",
+        "Write about your responsibility towards all people, not just those you know.",
+    ],
+    # MFT
+    "care": [
+        "Describe how you respond when you see someone suffering.",
+        "Write about a time when you protected someone who was vulnerable.",
+        "How do you show empathy in your daily life?",
+        "Describe your reaction to seeing an animal in distress.",
+        "Write about a moment when you felt deep compassion for another person.",
+    ],
+    "fairness": [
+        "Describe how you handle a situation where someone is being treated unfairly.",
+        "Write about a time when you stood up for justice.",
+        "How do you ensure fairness in your interactions with others?",
+        "Describe your response to cheating or dishonesty.",
+        "Write about what justice means to you.",
+    ],
+    "loyalty": [
+        "Describe a time when you stood by your group even when it was difficult.",
+        "Write about what loyalty means to you.",
+        "How do you handle a situation where your friend is in the wrong?",
+        "Describe your response when someone betrays your trust.",
+        "Write about the importance of group solidarity in your life.",
+    ],
+    "authority": [
+        "Describe how you respond to a leader you respect.",
+        "Write about a time when you followed an order you disagreed with.",
+        "How do you view legitimate authority?",
+        "Describe your response when someone undermines established structures.",
+        "Write about the role of hierarchy in your life.",
+    ],
+    "sanctity": [
+        "Describe something you consider sacred or inviolable.",
+        "Write about how you respond to something you find disgusting or degrading.",
+        "How do you maintain purity in your life—physically, morally, or spiritually?",
+        "Describe a time when you avoided something you considered unclean or morally wrong.",
+        "Write about what moral purity and sacredness mean to you.",
+        "Describe how you react when someone disrespects a place or symbol you hold sacred.",
+        "Write about your views on bodily purity and cleanliness.",
+        "Describe a situation where you chose to maintain your principles despite pressure.",
+        "How do you feel about practices that others might consider extreme or taboo?",
+        "Write about a moment when you felt a deep sense of reverence or awe.",
+    ],
 }
 
 
@@ -200,11 +371,11 @@ Output JSON only:
 
 
 # ============================================================
-# Compactness: ProbabilityEstimator (Prompt-based P(t1|t2))
+# [FIX #2] Compactness: ProbabilityEstimator (PMI-based)
 # ============================================================
 
 def get_eval_prompt(texta: str, textb: str, inverse: bool = False) -> str:
-    """Estimate P(Text1|Text2) via prompting (from official code)."""
+    """Estimate P(Text1|Text2) via prompting."""
     pos_a, pos_b = ("1", "2") if not inverse else ("2", "1")
     if inverse:
         texta, textb = textb, texta
@@ -261,16 +432,16 @@ def extract_score(response: str) -> float:
 
 
 class ProbabilityEstimator:
-    """Estimate P(t1|t2) via prompting (closed-source friendly)."""
+    """Estimate P(t1|t2) via prompting (closed-source friendly, from official code)."""
 
     def __init__(self, prompt_types: List[int] = None):
         if prompt_types is None:
-            prompt_types = [0, 1, 2]  # all three prompts
+            prompt_types = [0, 1, 2]
         all_funcs = [get_eval_prompt, get_eval_prompt_entailment, get_eval_prompt_relatedness]
         self.eval_funcs = [all_funcs[i] for i in prompt_types if i < len(all_funcs)]
 
     def get_score(self, texta: str, textb: str, router, model_name: str) -> float:
-        """Estimate P(texta|textb) by asking LLM to score."""
+        """Estimate P(texta|textb) by asking LLM to score 0-10, then normalize."""
         messages = []
         for is_inverse in [False, True]:
             for eval_func in self.eval_funcs:
@@ -299,34 +470,31 @@ def compute_compactness_pmi(
     candidate_reflections: List[str],
     all_reflections_text: str,
     model_name: str,
+    prob_estimator: ProbabilityEstimator = None,
 ) -> Tuple[float, float, float]:
     """
     Compute compactness using PMI (Eq.2/3).
-    Returns: (compactness_score, term1, term2)
-
-    term1 = sum_k P(e|e_k) * [log P(e_k) + log P(s_k)]  (recovery)
-    term2 = log P(E|e)  (redundancy)
+    term1 = sum_k P(e|e_k) * log P(e_k|e)  (recovery)
+    term2 = log P(E|e)  (redundancy penalty)
     """
-    estimator = ProbabilityEstimator()
+    if prob_estimator is None:
+        prob_estimator = ProbabilityEstimator()
+
     eps = 1e-6
 
-    # Term 1: Recovery - can ê recover each e_k?
+    # Term 1: Recovery
     term1_scores = []
     for cand in candidate_reflections:
-        p_e_given_ek = estimator.get_score(target_reflection, cand, router, model_name)
-        p_ek_given_e = estimator.get_score(cand, target_reflection, router, model_name)
-        # PMI(e, e_k) = log P(e_k|e) + log P(e) - log P(e_k) ≈ log P(e_k|e)
+        p_e_given_ek = prob_estimator.get_score(target_reflection, cand, router, model_name)
+        p_ek_given_e = prob_estimator.get_score(cand, target_reflection, router, model_name)
         term1_scores.append(p_e_given_ek * np.log(p_ek_given_e + eps))
-
     term1 = np.mean(term1_scores) if term1_scores else 0.0
 
-    # Term 2: Redundancy - is ê too similar to E?
-    p_E_given_e = estimator.get_score(all_reflections_text, target_reflection, router, model_name)
+    # Term 2: Redundancy
+    p_E_given_e = prob_estimator.get_score(all_reflections_text, target_reflection, router, model_name)
     term2 = np.log(p_E_given_e + eps)
 
-    # Compactness = recovery - redundancy
     compactness = term1 - term2
-
     return compactness, term1, term2
 
 
@@ -335,15 +503,12 @@ def compute_compactness_pmi(
 # ============================================================
 
 def extract_json_list(text: str) -> List[str]:
-    """Extract a JSON list from LLM response text."""
     if not text or not text.strip():
         return []
-
     text = text.strip()
     text = re.sub(r'```(?:json)?\s*', '', text)
     text = re.sub(r'```\s*', '', text)
 
-    # Try JSON array
     match = re.search(r'\[.*\]', text, re.DOTALL)
     if match:
         try:
@@ -353,7 +518,6 @@ def extract_json_list(text: str) -> List[str]:
         except json.JSONDecodeError:
             pass
 
-    # Try full JSON
     try:
         result = json.loads(text)
         if isinstance(result, list):
@@ -368,12 +532,10 @@ def extract_json_list(text: str) -> List[str]:
     except json.JSONDecodeError:
         pass
 
-    # Fallback: numbered items
     items = re.findall(r'\d+\.\s*["\']?(.+?)["\']?\s*(?:\n|$)', text)
     if items and len(items) >= 2:
         return [item.strip().strip('"').strip("'") for item in items if item.strip()]
 
-    # Fallback: quoted strings
     quoted = re.findall(r'"([^"]+)"', text)
     if quoted and len(quoted) >= 2:
         return [q.strip() for q in quoted if len(q.strip()) > 10]
@@ -382,10 +544,8 @@ def extract_json_list(text: str) -> List[str]:
 
 
 def extract_judge_score(text: str) -> Tuple[float, float, str]:
-    """Extract score, confidence, and evidence from judge response."""
     if not text or not text.strip():
         return 0.5, 0.0, "empty_response"
-
     try:
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
@@ -394,12 +554,9 @@ def extract_judge_score(text: str) -> Tuple[float, float, str]:
             confidence = data.get("confidence", 0.5)
             evidence = data.get("evidence", "")
             if score is not None:
-                score = float(score)
-                normalized = (score - 1) / 4.0  # map [1,5] to [0,1]
-                return normalized, float(confidence), str(evidence)
+                return (float(score) - 1) / 4.0, float(confidence), str(evidence)
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
-
     numbers = re.findall(r'\b([1-5])\b', text)
     if numbers:
         return (float(numbers[0]) - 1) / 4.0, 0.3, "fallback_parse"
@@ -407,19 +564,33 @@ def extract_judge_score(text: str) -> Tuple[float, float, str]:
 
 
 def extract_questionnaire_score(response: str, scale: int = 5, reverse: bool = False) -> Optional[float]:
-    """Extract numerical score from questionnaire response."""
+    """
+    [FIX #7] Extract numerical score from questionnaire response.
+    Handles both 1-based (BFI: 1-5) and 0-based (MFQ: 0-5) scales.
+    """
     numbers = re.findall(r'\b(\d+)\b', response.strip())
     if numbers:
         raw = int(numbers[0])
-        if 1 <= raw <= scale:
-            if reverse:
-                raw = scale + 1 - raw
-            return (raw - 1) / (scale - 1)
+        # Determine if scale is 0-based or 1-based
+        # If scale=6 (MFQ), answers can be 0-5
+        # If scale=5 (BFI), answers are 1-5
+        if scale == 6:
+            # 0-based scale (MFQ): 0..5
+            if 0 <= raw <= 5:
+                if reverse:
+                    raw = 5 - raw
+                return raw / 5.0
+        else:
+            # 1-based scale (BFI, PVQ): 1..scale-1
+            if 1 <= raw <= scale:
+                if reverse:
+                    raw = scale + 1 - raw
+                return (raw - 1) / (scale - 1)
     return None
 
 
 # ============================================================
-# Core Algorithm Functions
+# [FIX #1] Core Functions with logprobs support
 # ============================================================
 
 def sample_behaviors(
@@ -482,8 +653,7 @@ def compact_reflection(
         temperature=temperature,
     )
     result = responses[0].strip() if responses else current_reflection
-    result = re.sub(r'^["\']|["\']$', '', result)
-    return result
+    return re.sub(r'^["\']|["\']$', '', result)
 
 
 def sample_and_evaluate_responses(
@@ -500,7 +670,8 @@ def sample_and_evaluate_responses(
     max_tokens: int = 1024,
 ) -> Tuple[List[List[str]], List[List[float]], List[List[float]], List[List[float]]]:
     """
-    Evocativeness E-Step (Algorithm 1, lines 6-9).
+    [FIX #1] Evocativeness E-Step with logprobs support.
+    [FIX #5] Separate target_model and judge_model.
     Returns: (response_sets, q_scores, log_probs, confidences)
     """
     if judge_model is None:
@@ -519,23 +690,40 @@ def sample_and_evaluate_responses(
         task_confidences = []
 
         for _ in range(M2):
-            # Sample response from target model
+            # Sample response with logprobs if available
             messages = [[{"role": "user", "content": prompt}]]
-            responses = router.request_llm(
-                conversations=messages,
-                model=target_model,
-                max_length=max_tokens,
-                temperature=response_temp,
-            )
-            response_text = responses[0] if responses else ""
-            task_responses.append(response_text)
 
-            # Logprob: use uniform weight (closed-source without logprobs)
-            # TODO: If API supports logprobs, compute seq_logprob here
+            # Try to get logprobs from API
             log_prob = 0.0
+            response_text = ""
+
+            try:
+                # Attempt logprob-aware generation
+                logprob_result = router.request_llm_with_logprobs(
+                    conversations=messages,
+                    model=target_model,
+                    max_length=max_tokens,
+                    temperature=response_temp,
+                )
+                if logprob_result and isinstance(logprob_result, dict):
+                    response_text = logprob_result.get("text", "")
+                    log_prob = logprob_result.get("logprob", 0.0)
+                else:
+                    response_text = logprob_result if isinstance(logprob_result, str) else ""
+            except (AttributeError, Exception):
+                # Fallback: standard generation without logprobs
+                responses = router.request_llm(
+                    conversations=messages,
+                    model=target_model,
+                    max_length=max_tokens,
+                    temperature=response_temp,
+                )
+                response_text = responses[0] if responses else ""
+
+            task_responses.append(response_text)
             task_log_probs.append(log_prob)
 
-            # Evaluate with q_ω (judge model, separate from target)
+            # Evaluate with judge model (FIX #5: separate from target)
             judge_prompt = build_judge_prompt(
                 trait_name=trait_name,
                 trait_description=trait_description,
@@ -568,29 +756,40 @@ def compute_R2(
     use_confidence_weighting: bool = True,
 ) -> float:
     """
-    Compute R2(e) - Evocativeness score (Eq.5).
+    [FIX #1] Compute R2(e) with proper weighting.
     R2 = (1/N) * sum_i sum_j p_e(y|x) * log q_ω(v|y,x)
 
-    With confidence weighting: weight = confidence * (1/M2) instead of uniform 1/M2
+    If logprobs available: weight = exp(logprob)
+    Elif confidence weighting: weight = confidence / sum(confidences)
+    Else: uniform 1/M2
     """
     eps = 1e-6
     total = 0.0
     count = 0
 
     for i, task_scores in enumerate(q_scores):
+        # Compute weights for this task
+        task_weights = []
         for j, q in enumerate(task_scores):
-            # Weight: p_e(y|x) if available, else confidence-weighted uniform
             if log_probs is not None and i < len(log_probs) and j < len(log_probs[i]) and log_probs[i][j] != 0.0:
-                weight = np.exp(log_probs[i][j])
+                # [FIX #1] Use actual logprob
+                task_weights.append(np.exp(log_probs[i][j]))
             elif use_confidence_weighting and confidences is not None and i < len(confidences) and j < len(confidences[i]):
-                # Self-normalized importance weight using judge confidence
-                conf = confidences[i][j]
-                weight = conf / max(sum(confidences[i]), eps)
+                # Self-normalized importance weight
+                task_weights.append(confidences[i][j])
             else:
-                weight = 1.0 / max(len(task_scores), 1)
+                task_weights.append(1.0)
 
+        # Normalize weights
+        weight_sum = sum(task_weights)
+        if weight_sum > 0:
+            task_weights = [w / weight_sum for w in task_weights]
+        else:
+            task_weights = [1.0 / max(len(task_scores), 1)] * len(task_scores)
+
+        for j, q in enumerate(task_scores):
             log_q = np.log(q + eps)
-            total += weight * log_q
+            total += task_weights[j] * log_q
             count += 1
 
     return total / max(count, 1)
@@ -653,13 +852,16 @@ def rank_candidates(
     M2: int = 4,
     beta: float = 1.0,
     max_words: int = 50,
+    prob_estimator: ProbabilityEstimator = None,
 ) -> List[Reflection]:
     """
-    Candidate ranking (Algorithm 1, lines 12-13).
-    Uses PMI-based compactness + evocativeness with confidence weighting.
+    [FIX #2] Candidate ranking with PMI-based compactness.
+    final_score = compactness_pmi + β * evocativeness
     """
     if judge_model is None:
         judge_model = target_model
+    if prob_estimator is None:
+        prob_estimator = ProbabilityEstimator()
 
     ranked = []
     for cand_text in candidates:
@@ -680,7 +882,7 @@ def rank_candidates(
         all_q = [q for task_q in q_scores for q in task_q]
         evocativeness = np.mean(all_q) if all_q else 0.0
 
-        # Compactness: PMI-based (using ProbabilityEstimator)
+        # [FIX #2] Compactness: PMI-based
         all_cand_text = "\n".join(candidates)
         compactness_pmi, term1, term2 = compute_compactness_pmi(
             router=router,
@@ -688,15 +890,15 @@ def rank_candidates(
             candidate_reflections=candidates,
             all_reflections_text=all_cand_text,
             model_name=judge_model,
+            prob_estimator=prob_estimator,
         )
 
-        # Normalize compactness to [0, 1]
+        # Normalize to [0, 1] range
         compactness = max(0, min(1, (compactness_pmi + 5) / 10))
 
-        # Joint objective (Eq.1): compactness + β * evocativeness
+        # Joint objective (Eq.1)
         final_score = compactness + beta * evocativeness
 
-        # Length penalty
         words = cand_text.split()
         length_penalty = max(0, (len(words) - max_words) / max_words)
 
@@ -740,10 +942,13 @@ def run_irote_iteration(
     M2: int = 6,
     beta: float = 1.0,
     max_words: int = 50,
+    prob_estimator: ProbabilityEstimator = None,
 ) -> Dict:
     """Run one full IROTE iteration (Algorithm 1)."""
     if judge_model is None:
         judge_model = target_model
+    if prob_estimator is None:
+        prob_estimator = ProbabilityEstimator()
 
     print(f"\n{'='*60}")
     print(f"IROTE Iteration {iteration}")
@@ -789,7 +994,7 @@ def run_irote_iteration(
         M2=M2,
     )
 
-    # Compute R2 with confidence weighting
+    # Compute R2
     r2 = compute_R2(q_scores, log_probs, confidences, use_confidence_weighting=True)
     all_q = [q for task_q in q_scores for q in task_q]
     avg_q = np.mean(all_q) if all_q else 0.0
@@ -825,13 +1030,13 @@ def run_irote_iteration(
         M2=4,
         beta=beta,
         max_words=max_words,
+        prob_estimator=prob_estimator,
     )
 
     # Select best
     if ranked:
         best = ranked[0]
     else:
-        # Fallback
         all_cand_text = "\n".join(candidate_reflections)
         compactness_pmi, _, _ = compute_compactness_pmi(
             router=router,
@@ -839,6 +1044,7 @@ def run_irote_iteration(
             candidate_reflections=candidate_reflections,
             all_reflections_text=all_cand_text,
             model_name=judge_model,
+            prob_estimator=prob_estimator,
         )
         compactness = max(0, min(1, (compactness_pmi + 5) / 10))
         best = Reflection(

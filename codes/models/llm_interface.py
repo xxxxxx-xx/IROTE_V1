@@ -210,6 +210,44 @@ class GenericAPIModel(LLM):
                 return await cls.async_process(message, max_tokens, retry - 1, temperature)
             raise
 
+    @classmethod
+    def process_with_logprobs(cls, message, max_tokens=2000, retry=2, temperature=1.0):
+        """
+        [FIX #1] Request completion with logprobs for p_e(y|x).
+        Returns: {"text": str, "logprob": float}
+        """
+        client = cls.get_setting()
+        try:
+            response = client.chat.completions.create(
+                model=cls.model_name,
+                messages=message,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                logprobs=True,
+                top_logprobs=1,
+            )
+            text = response.choices[0].message.content or ""
+
+            # Compute sequence logprob
+            logprob_sum = 0.0
+            token_count = 0
+            if hasattr(response.choices[0], 'logprobs') and response.choices[0].logprobs:
+                for token_info in response.choices[0].logprobs.content:
+                    if token_info.logprob is not None:
+                        logprob_sum += token_info.logprob
+                        token_count += 1
+
+            avg_logprob = logprob_sum / max(token_count, 1)
+
+            with cls.lock:
+                cls.token_count += getattr(response.usage, 'total_tokens', 0) if response.usage else 0
+
+            return {"text": text, "logprob": avg_logprob}
+        except Exception as e:
+            # Fallback: standard generation
+            text = cls.process(message, max_tokens, retry, temperature)
+            return {"text": text, "logprob": 0.0}
+
 
 def _register_generic_models():
     """Dynamically register models from config.GENERIC_API_MODELS."""
@@ -276,6 +314,22 @@ class LLMFactory:
     @classmethod
     def gather_multiple_messages(cls, messages, model_name, **kwargs):
         return asyncio.run(cls.gather_multiple_async_messages(messages, model_name, **kwargs))
+
+    @classmethod
+    def gather_messages_with_logprobs(cls, messages, model_name, **kwargs):
+        """
+        [FIX #1] Request with logprobs for p_e(y|x) estimation.
+        Returns: {"text": str, "logprob": float} for first message.
+        """
+        if model_name in PRODUCT_MAP:
+            product = PRODUCT_MAP[model_name]
+            if hasattr(product, 'process_with_logprobs'):
+                return product.process_with_logprobs(messages[0] if messages else [], **kwargs)
+            else:
+                # Fallback
+                text = product.process(message=messages[0] if messages else [], **kwargs)
+                return {"text": text, "logprob": 0.0}
+        raise NotImplementedError(f"{model_name} not registered")
 
     @classmethod
     def print_token_count(cls, model_name):
